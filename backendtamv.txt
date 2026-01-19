@@ -1,0 +1,789 @@
+
+TAMV Backend - Versión Producción
+Sistema completo con persistencia, seguridad, escalabilidad y APIs reales
+Versión: 1.0.0 - Production Ready
+
+
+import asyncio
+import aioredis
+from typing import Dict, Any, List, Optional, Tuple, Set, Union
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from datetime import datetime, timedelta
+import hashlib
+import jwt
+import uuid
+import json
+import logging
+from contextlib import asynccontextmanager
+from pydantic import BaseModel, EmailStr, validator, Field
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, ForeignKey, Text, Index, JSON
+import bcrypt
+from aiocache import Cache, cached
+from aiocache.serializers import JsonSerializer
+import aioboto3
+from passlib.context import CryptContext
+import redis.asyncio as redis
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import sentry_sdk
+from prometheus_client import Counter, Histogram, Gauge
+import msgpack
+
+# ============================================================================
+# CONFIGURACIÓN Y LOGGING
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Sentry para monitoreo de errores
+sentry_sdk.init(
+    dsn="",  # Configurar con DSN real
+    traces_sample_rate=0.1,
+    environment="production"
+)
+
+# Métricas Prometheus
+requests_total = Counter('tamv_requests_total', 'Total requests', ['method', 'endpoint'])
+request_duration = Histogram('tamv_request_duration_seconds', 'Request duration')
+active_users = Gauge('tamv_active_users', 'Number of active users')
+active_streams = Gauge('tamv_active_streams', 'Number of active streams')
+
+# ============================================================================
+# CONFIGURACIÓN DE BASE DE DATOS
+# ============================================================================
+
+DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/tamv_db"
+REDIS_URL = "redis://localhost:6379"
+
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=20,
+    max_overflow=40,
+    pool_pre_ping=True,
+    pool_recycle=3600
+)
+
+async_session_maker = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
+
+Base = declarative_base()
+
+# ============================================================================
+# MODELOS SQLAlchemy (Persistencia Real)
+# ============================================================================
+
+class UserModel(Base):
+    __tablename__ = "users"
+    
+    id = Column(String(24), primary_key=True)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    email = Column(String(120), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    profile_data = Column(JSON, default={})
+    reputation_score = Column(Float, default=0.0)
+    is_online = Column(Boolean, default=False)
+    is_verified = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    last_activity = Column(DateTime, default=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_user_activity', 'last_activity'),
+        Index('idx_user_reputation', 'reputation_score'),
+    )
+
+class ChannelModel(Base):
+    __tablename__ = "channels"
+    
+    id = Column(String(24), primary_key=True)
+    name = Column(String(100), nullable=False)
+    type = Column(String(20), nullable=False, index=True)
+    owner_id = Column(String(24), ForeignKey('users.id'), nullable=False)
+    privacy_level = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    message_count = Column(Integer, default=0)
+    metadata = Column(JSON, default={})
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    __table_args__ = (
+        Index('idx_channel_owner', 'owner_id'),
+        Index('idx_channel_type', 'type'),
+    )
+
+class MessageModel(Base):
+    __tablename__ = "messages"
+    
+    id = Column(String(24), primary_key=True)
+    channel_id = Column(String(24), ForeignKey('channels.id'), nullable=False, index=True)
+    sender_id = Column(String(24), ForeignKey('users.id'), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    content_type = Column(String(20), default="text")
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    edited_at = Column(DateTime, nullable=True)
+    is_deleted = Column(Boolean, default=False)
+    metadata = Column(JSON, default={})
+    
+    __table_args__ = (
+        Index('idx_message_channel_time', 'channel_id', 'timestamp'),
+    )
+
+class PostModel(Base):
+    __tablename__ = "posts"
+    
+    id = Column(String(24), primary_key=True)
+    author_id = Column(String(24), ForeignKey('users.id'), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    content_type = Column(String(20), default="text")
+    privacy_level = Column(Integer, default=0)
+    likes_count = Column(Integer, default=0)
+    comments_count = Column(Integer, default=0)
+    shares_count = Column(Integer, default=0)
+    views_count = Column(Integer, default=0)
+    is_pinned = Column(Boolean, default=False)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    media_urls = Column(JSON, default=[])
+    tags = Column(JSON, default=[])
+    
+    __table_args__ = (
+        Index('idx_post_author_time', 'author_id', 'timestamp'),
+        Index('idx_post_trending', 'likes_count', 'timestamp'),
+    )
+
+# ============================================================================
+# PYDANTIC MODELS (Validación y Serialización)
+# ============================================================================
+
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50, regex="^[a-zA-Z0-9_]+$")
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=128)
+    
+    @validator('password')
+    def validate_password_strength(cls, v):
+        if not any(c.isupper() for c in v):
+            raise ValueError('Password must contain uppercase letter')
+        if not any(c.islower() for c in v):
+            raise ValueError('Password must contain lowercase letter')
+        if not any(c.isdigit() for c in v):
+            raise ValueError('Password must contain digit')
+        return v
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+class MessageCreate(BaseModel):
+    channel_id: str
+    content: str = Field(..., min_length=1, max_length=5000)
+    content_type: str = "text"
+    
+    @validator('content')
+    def sanitize_content(cls, v):
+        # Sanitización básica
+        return v.strip()
+
+class PostCreate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=10000)
+    content_type: str = "text"
+    privacy_level: int = Field(default=0, ge=0, le=4)
+    media_urls: List[str] = []
+    tags: List[str] = []
+
+# ============================================================================
+# SISTEMA DE AUTENTICACIÓN Y SEGURIDAD
+# ============================================================================
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+SECRET_KEY = "your-secret-key-change-in-production"  # Usar variables de entorno
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+REFRESH_TOKEN_EXPIRE_DAYS = 30
+
+class AuthService:
+    """Servicio de autenticación con JWT y Redis"""
+    
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+    
+    def hash_password(self, password: str) -> str:
+        return pwd_context.hash(password)
+    
+    def verify_password(self, plain_password: str, hashed_password: str) -> bool:
+        return pwd_context.verify(plain_password, hashed_password)
+    
+    def create_access_token(self, data: dict) -> str:
+        to_encode = data.copy()
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        to_encode.update({"exp": expire, "type": "access"})
+        return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    
+    def create_refresh_token(self, data: dict) -> str:
+        to_encode = data.copy()
+        expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        to_encode.update({"exp": expire, "type": "refresh"})
+        return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    
+    async def verify_token(self, token: str) -> Optional[dict]:
+        try:
+            # Verificar si el token está en blacklist
+            is_blacklisted = await self.redis.exists(f"blacklist:{token}")
+            if is_blacklisted:
+                return None
+            
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            return payload
+        except jwt.ExpiredSignatureError:
+            logger.warning("Token expired")
+            return None
+        except jwt.JWTError as e:
+            logger.error(f"JWT error: {e}")
+            return None
+    
+    async def blacklist_token(self, token: str, expires_in: int):
+        """Agregar token a blacklist (para logout)"""
+        await self.redis.setex(
+            f"blacklist:{token}",
+            expires_in,
+            "1"
+        )
+    
+    async def store_session(self, user_id: str, session_data: dict):
+        """Almacenar sesión de usuario en Redis"""
+        await self.redis.setex(
+            f"session:{user_id}",
+            3600,
+            json.dumps(session_data)
+        )
+    
+    async def get_session(self, user_id: str) -> Optional[dict]:
+        """Obtener sesión de usuario"""
+        data = await self.redis.get(f"session:{user_id}")
+        return json.loads(data) if data else None
+
+# ============================================================================
+# RATE LIMITING
+# ============================================================================
+
+limiter = Limiter(key_func=get_remote_address)
+
+# ============================================================================
+# CACHE MANAGER CON REDIS
+# ============================================================================
+
+class CacheManager:
+    """Gestor de caché con Redis para optimización"""
+    
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+    
+    async def get(self, key: str) -> Optional[Any]:
+        data = await self.redis.get(key)
+        if data:
+            return msgpack.unpackb(data, raw=False)
+        return None
+    
+    async def set(self, key: str, value: Any, expire: int = 300):
+        packed = msgpack.packb(value, use_bin_type=True)
+        await self.redis.setex(key, expire, packed)
+    
+    async def delete(self, key: str):
+        await self.redis.delete(key)
+    
+    async def invalidate_pattern(self, pattern: str):
+        """Invalida todas las keys que coincidan con el patrón"""
+        keys = []
+        async for key in self.redis.scan_iter(match=pattern):
+            keys.append(key)
+        if keys:
+            await self.redis.delete(*keys)
+
+# ============================================================================
+# DATABASE REPOSITORY PATTERN
+# ============================================================================
+
+class UserRepository:
+    """Repository para operaciones de usuarios"""
+    
+    def __init__(self, session: AsyncSession, cache: CacheManager):
+        self.session = session
+        self.cache = cache
+    
+    async def create(self, user_data: UserCreate, password_hash: str) -> UserModel:
+        user = UserModel(
+            id=f"user_{uuid.uuid4().hex[:12]}",
+            username=user_data.username,
+            email=user_data.email,
+            password_hash=password_hash
+        )
+        self.session.add(user)
+        await self.session.commit()
+        await self.session.refresh(user)
+        return user
+    
+    async def get_by_email(self, email: str) -> Optional[UserModel]:
+        from sqlalchemy import select
+        
+        # Intentar obtener de caché
+        cache_key = f"user:email:{email}"
+        cached = await self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        result = await self.session.execute(
+            select(UserModel).where(UserModel.email == email)
+        )
+        user = result.scalar_one_or_none()
+        
+        if user:
+            await self.cache.set(cache_key, user, expire=600)
+        
+        return user
+    
+    async def get_by_id(self, user_id: str) -> Optional[UserModel]:
+        from sqlalchemy import select
+        
+        cache_key = f"user:id:{user_id}"
+        cached = await self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        result = await self.session.execute(
+            select(UserModel).where(UserModel.id == user_id)
+        )
+        user = result.scalar_one_or_none()
+        
+        if user:
+            await self.cache.set(cache_key, user, expire=600)
+        
+        return user
+    
+    async def update_activity(self, user_id: str):
+        from sqlalchemy import update
+        
+        await self.session.execute(
+            update(UserModel)
+            .where(UserModel.id == user_id)
+            .values(last_activity=datetime.utcnow(), is_online=True)
+        )
+        await self.session.commit()
+        
+        # Invalidar caché
+        await self.cache.delete(f"user:id:{user_id}")
+
+class MessageRepository:
+    """Repository para mensajes con paginación eficiente"""
+    
+    def __init__(self, session: AsyncSession):
+        self.session = session
+    
+    async def create(self, message_data: MessageCreate, sender_id: str) -> MessageModel:
+        message = MessageModel(
+            id=f"msg_{uuid.uuid4().hex[:12]}",
+            channel_id=message_data.channel_id,
+            sender_id=sender_id,
+            content=message_data.content,
+            content_type=message_data.content_type
+        )
+        self.session.add(message)
+        await self.session.commit()
+        await self.session.refresh(message)
+        return message
+    
+    async def get_channel_messages(
+        self,
+        channel_id: str,
+        limit: int = 50,
+        before_id: Optional[str] = None
+    ) -> List[MessageModel]:
+        from sqlalchemy import select, and_
+        
+        query = select(MessageModel).where(
+            and_(
+                MessageModel.channel_id == channel_id,
+                MessageModel.is_deleted == False
+            )
+        )
+        
+        if before_id:
+            # Paginación cursor-based
+            query = query.where(MessageModel.id < before_id)
+        
+        query = query.order_by(MessageModel.timestamp.desc()).limit(limit)
+        
+        result = await self.session.execute(query)
+        return result.scalars().all()
+
+# ============================================================================
+# WEBSOCKET MANAGER PARA TIEMPO REAL
+# ============================================================================
+
+class ConnectionManager:
+    """Gestor de conexiones WebSocket para comunicación en tiempo real"""
+    
+    def __init__(self):
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
+        self.user_connections: Dict[str, WebSocket] = {}
+    
+    async def connect(self, websocket: WebSocket, user_id: str):
+        await websocket.accept()
+        self.user_connections[user_id] = websocket
+        active_users.inc()
+        logger.info(f"User {user_id} connected via WebSocket")
+    
+    async def disconnect(self, user_id: str):
+        if user_id in self.user_connections:
+            del self.user_connections[user_id]
+            active_users.dec()
+            logger.info(f"User {user_id} disconnected")
+    
+    async def join_channel(self, channel_id: str, websocket: WebSocket):
+        if channel_id not in self.active_connections:
+            self.active_connections[channel_id] = set()
+        self.active_connections[channel_id].add(websocket)
+    
+    async def leave_channel(self, channel_id: str, websocket: WebSocket):
+        if channel_id in self.active_connections:
+            self.active_connections[channel_id].discard(websocket)
+    
+    async def broadcast_to_channel(self, channel_id: str, message: dict):
+        if channel_id in self.active_connections:
+            disconnected = set()
+            for connection in self.active_connections[channel_id]:
+                try:
+                    await connection.send_json(message)
+                except Exception as e:
+                    logger.error(f"Error broadcasting: {e}")
+                    disconnected.add(connection)
+            
+            # Limpiar conexiones muertas
+            self.active_connections[channel_id] -= disconnected
+    
+    async def send_to_user(self, user_id: str, message: dict):
+        if user_id in self.user_connections:
+            try:
+                await self.user_connections[user_id].send_json(message)
+            except Exception as e:
+                logger.error(f"Error sending to user {user_id}: {e}")
+                await self.disconnect(user_id)
+
+# ============================================================================
+# S3 STORAGE PARA ARCHIVOS MULTIMEDIA
+# ============================================================================
+
+class S3StorageManager:
+    """Gestor de almacenamiento S3 para archivos multimedia"""
+    
+    def __init__(self, bucket_name: str, region: str = "us-east-1"):
+        self.bucket_name = bucket_name
+        self.region = region
+        self.session = aioboto3.Session()
+    
+    async def upload_file(
+        self,
+        file_data: bytes,
+        file_key: str,
+        content_type: str
+    ) -> str:
+        """Sube archivo a S3 y retorna URL"""
+        async with self.session.client('s3', region_name=self.region) as s3:
+            await s3.put_object(
+                Bucket=self.bucket_name,
+                Key=file_key,
+                Body=file_data,
+                ContentType=content_type,
+                ACL='public-read'
+            )
+        
+        return f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/{file_key}"
+    
+    async def generate_presigned_url(
+        self,
+        file_key: str,
+        expiration: int = 3600
+    ) -> str:
+        """Genera URL pre-firmada para upload directo"""
+        async with self.session.client('s3', region_name=self.region) as s3:
+            url = await s3.generate_presigned_url(
+                'put_object',
+                Params={
+                    'Bucket': self.bucket_name,
+                    'Key': file_key
+                },
+                ExpiresIn=expiration
+            )
+        return url
+    
+    async def delete_file(self, file_key: str):
+        """Elimina archivo de S3"""
+        async with self.session.client('s3', region_name=self.region) as s3:
+            await s3.delete_object(
+                Bucket=self.bucket_name,
+                Key=file_key
+            )
+
+# ============================================================================
+# FASTAPI APPLICATION
+# ============================================================================
+
+app = FastAPI(
+    title="TAMV Platform API",
+    version="3.0.0",
+    description="Production-ready social platform with real-time features"
+)
+
+# Middlewares
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configurar dominios específicos en producción
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Dependencias globales
+redis_client: Optional[redis.Redis] = None
+auth_service: Optional[AuthService] = None
+cache_manager: Optional[CacheManager] = None
+ws_manager = ConnectionManager()
+s3_storage: Optional[S3StorageManager] = None
+
+@app.on_event("startup")
+async def startup_event():
+    global redis_client, auth_service, cache_manager, s3_storage
+    
+    # Conectar a Redis
+    redis_client = await redis.from_url(
+        REDIS_URL,
+        encoding="utf-8",
+        decode_responses=False
+    )
+    
+    # Inicializar servicios
+    auth_service = AuthService(redis_client)
+    cache_manager = CacheManager(redis_client)
+    s3_storage = S3StorageManager(bucket_name="tamv-media")
+    
+    # Crear tablas
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    
+    logger.info("✅ Application started successfully")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if redis_client:
+        await redis_client.close()
+    logger.info("Application shutdown complete")
+
+# Dependency para obtener sesión de BD
+async def get_db() -> AsyncSession:
+    async with async_session_maker() as session:
+        yield session
+
+# Dependency para autenticación
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db)
+) -> UserModel:
+    token = credentials.credentials
+    payload = await auth_service.verify_token(token)
+    
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
+    
+    user_repo = UserRepository(db, cache_manager)
+    user = await user_repo.get_by_id(payload.get("sub"))
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found"
+        )
+    
+    return user
+
+# ============================================================================
+# ENDPOINTS - AUTENTICACIÓN
+# ============================================================================
+
+@app.post("/api/v1/auth/register", response_model=TokenResponse)
+@limiter.limit("5/minute")
+async def register(
+    user_data: UserCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Registro de nuevo usuario"""
+    requests_total.labels(method="POST", endpoint="/auth/register").inc()
+    
+    user_repo = UserRepository(db, cache_manager)
+    
+    # Verificar si el usuario ya existe
+    existing = await user_repo.get_by_email(user_data.email)
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Crear usuario
+    password_hash = auth_service.hash_password(user_data.password)
+    user = await user_repo.create(user_data, password_hash)
+    
+    # Generar tokens
+    access_token = auth_service.create_access_token({"sub": user.id})
+    refresh_token = auth_service.create_refresh_token({"sub": user.id})
+    
+    logger.info(f"New user registered: {user.id}")
+    
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+
+@app.post("/api/v1/auth/login", response_model=TokenResponse)
+@limiter.limit("10/minute")
+async def login(
+    credentials: UserLogin,
+    db: AsyncSession = Depends(get_db)
+):
+    """Login de usuario"""
+    requests_total.labels(method="POST", endpoint="/auth/login").inc()
+    
+    user_repo = UserRepository(db, cache_manager)
+    user = await user_repo.get_by_email(credentials.email)
+    
+    if not user or not auth_service.verify_password(
+        credentials.password,
+        user.password_hash
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials"
+        )
+    
+    # Actualizar actividad
+    await user_repo.update_activity(user.id)
+    
+    # Generar tokens
+    access_token = auth_service.create_access_token({"sub": user.id})
+    refresh_token = auth_service.create_refresh_token({"sub": user.id})
+    
+    # Almacenar sesión
+    await auth_service.store_session(user.id, {
+        "login_time": datetime.utcnow().isoformat(),
+        "ip": "unknown"  # Obtener de request
+    })
+    
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+
+# ============================================================================
+# ENDPOINTS - MENSAJERÍA
+# ============================================================================
+
+@app.post("/api/v1/messages")
+@limiter.limit("60/minute")
+async def send_message(
+    message_data: MessageCreate,
+    current_user: UserModel = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Enviar mensaje a un canal"""
+    requests_total.labels(method="POST", endpoint="/messages").inc()
+    
+    msg_repo = MessageRepository(db)
+    message = await msg_repo.create(message_data, current_user.id)
+    
+    # Broadcast en tiempo real
+    await ws_manager.broadcast_to_channel(
+        message_data.channel_id,
+        {
+            "type": "new_message",
+            "data": {
+                "id": message.id,
+                "sender_id": current_user.id,
+                "sender_username": current_user.username,
+                "content": message.content,
+                "timestamp": message.timestamp.isoformat()
+            }
+        }
+    )
+    
+    return {"message_id": message.id, "status": "sent"}
+
+@app.get("/api/v1/channels/{channel_id}/messages")
+async def get_messages(
+    channel_id: str,
+    limit: int = 50,
+    before_id: Optional[str] = None,
+    current_user: UserModel = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtener mensajes de un canal con paginación"""
+    msg_repo = MessageRepository(db)
+    messages = await msg_repo.get_channel_messages(channel_id, limit, before_id)
+    
+    return {
+        "messages": [
+            {
+                "id": msg.id,
+                "sender_id": msg.sender_id,
+                "content": msg.content,
+                "timestamp": msg.timestamp.isoformat()
+            }
+            for msg in messages
+        ],
+        "has_more": len(messages) == limit
+    }
+
+# ============================================================================
+# WEBSOCKET ENDPOINT
+# ============================================================================
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await ws_manager.connect(websocket, user_id)
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            
+            # Manejar diferentes tipos de mensajes
+            if data.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+            
+            elif data.get("type") == "join_channel":
+                await ws_manager.join_channel(data["channel_id"], websocket)
